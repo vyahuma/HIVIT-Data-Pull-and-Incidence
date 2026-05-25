@@ -2,3 +2,7 @@
 .Rhistory
 .RData
 .Ruserdata
+.Renviron
+logs
+output
+data_source
