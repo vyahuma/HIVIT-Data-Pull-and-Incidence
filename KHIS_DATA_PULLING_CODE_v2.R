@@ -12,7 +12,7 @@ if (file.exists(renv_file)) {
 if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
 # Use pacman to load and install packages
 pacman::p_load(rio, zoo, tidyverse, formattable, ggforce, ggthemes, RODBC, patchwork,tidytext, data.table, lubridate,
-               httr,curl,readxl,openxlsx,foreach, doParallel, jsonlite, future.apply, progress,  pbapply, future, furrr, progressr, promises,
+               httr,curl,readxl,openxlsx,foreach,writexl, doParallel, jsonlite, future.apply, progress,  pbapply, future, furrr, progressr, promises,
                purrr, DBI,RMySQL, RMariaDB,stringr)
 
 #===============================================================================
@@ -654,10 +654,9 @@ colnames(np_monthly) = c("County", "SubCounty", "facilityname", "uid_khis", "mfl
 #===============================================================================
 
 safe_run(
-  quote(write.xlsx(
+  quote(writexl::write_xlsx(
     np_monthly,
-    file.path(EXTERNAL_OUTPUT_DIR,"np_monthly.xlsx"),
-    sheetName="Sheet1"
+    path = file.path(EXTERNAL_OUTPUT_DIR, "np_monthly.xlsx")
   )),
   "Write Excel Output"
 )
