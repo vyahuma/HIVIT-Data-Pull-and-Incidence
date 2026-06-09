@@ -7,9 +7,16 @@ renv_file <- Sys.getenv("PROJECT_RENVIRON", unset = ".Renviron")
 if (file.exists(renv_file)) {
   readRenviron(renv_file)
 }
-
-# Install pacman if not already installed
-if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+# Directory where required R packages will be installed
+shared_lib <- Sys.getenv("R_LIBS_USER")
+if (!dir.exists(shared_lib)) {
+  dir.create(shared_lib, recursive = TRUE)
+}
+.libPaths(shared_lib)
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman", lib = Sys.getenv("R_LIBS_USER"))
+}
+library(pacman, lib.loc = shared_lib)
 # Use pacman to load and install packages
 pacman::p_load(rio, zoo, tidyverse, formattable, ggforce, ggthemes, RODBC, patchwork,tidytext, data.table, lubridate,
                httr,curl,readxl,openxlsx,foreach,writexl, doParallel, jsonlite, future.apply, progress,  pbapply, future, furrr, progressr, promises,

@@ -53,7 +53,8 @@
 # File Paths
 # -----------------------------------------------------------------------------
 # Update these paths to point to your actual data files
-
+# Directory where the required packages will be installed
+shared_lib <- Sys.getenv("R_LIBS_USER")
 
 # -----------------------------------------------------------------------------
 # Protocol Parameters for Incidence Estimation
@@ -1846,9 +1847,14 @@ cat("Saved comprehensive incidence report to:", report_out_path, "\n")
 cat("\n")
 
 # Write to external access folder
+EXTERNAL_OUTPUT_DIR <- Sys.getenv("EXTERNAL_DIR", unset = "./data_source")
+
+# dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+# dir.create(LOG_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(EXTERNAL_OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
 incidence_out_path <- file.path(EXTERNAL_OUTPUT_DIR,"hivit_incidence.xlsx")
-dir.create(EXTERNAL_OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
 
 writexl::write_xlsx(
   list(
