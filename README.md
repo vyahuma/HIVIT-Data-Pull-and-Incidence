@@ -110,6 +110,23 @@ INCIDENCE_REPORT_XLSX=documents/report_table_new.xlsx
 PROJECT_RENVIRON=.Renviron
 ```
 
+Optional SQL Server export variables:
+
+```text
+SQLSERVER_ENABLED=true
+SQLSERVER_DRIVER=ODBC Driver 18 for SQL Server
+SQLSERVER_SERVER=your_server_name_or_ip
+SQLSERVER_DATABASE=your_database
+SQLSERVER_UID=your_username
+SQLSERVER_PWD=your_password
+SQLSERVER_SCHEMA=dbo
+SQLSERVER_ANALYTICS_TABLE=khis_analytics
+SQLSERVER_NP_MONTHLY_TABLE=khis_np_monthly
+SQLSERVER_TRUST_SERVER_CERTIFICATE=yes
+```
+
+When `SQLSERVER_ENABLED=true`, `KHIS_AUTO_DATA_PULL.R` writes the refreshed KHIS data to SQL Server only after the KHIS pull and transformations complete successfully. It opens a transaction, truncates the configured target tables, appends the new `analytics` and `np_monthly` data, then commits. If the data frames are empty or any database step fails, the transaction is rolled back.
+
 Do not commit real credentials or API keys.
 
 ## R Packages

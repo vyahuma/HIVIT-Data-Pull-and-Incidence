@@ -20,7 +20,7 @@ library(pacman, lib.loc = shared_lib)
 # Use pacman to load and install packages
 pacman::p_load(rio, zoo, tidyverse, formattable, ggforce, ggthemes, RODBC, patchwork,tidytext, data.table, lubridate,
                httr,curl,readxl,openxlsx,foreach,writexl, doParallel, jsonlite, future.apply, progress,  pbapply, future, furrr, progressr, promises,
-               purrr, DBI,RMySQL, RMariaDB,stringr)
+               purrr, DBI, odbc, RMySQL, RMariaDB,stringr)
 
 #===============================================================================
 # 2. DIRECTORIES & LOGGING
@@ -99,6 +99,54 @@ safe_run <- function(expr, step_name){
     )
     
     quit(save="no", status=1)
+  })
+}
+
+write_khis_tables_to_sql_server <- function(analytics_df, np_monthly_df) {
+  sql_enabled <- tolower(Sys.getenv("SQLSERVER_ENABLED", unset = "false")) %in% c("true", "1", "yes", "y")
+
+  if (!sql_enabled) {
+    log_message("SQL Server export skipped because SQLSERVER_ENABLED is not true or is not set. Set SQLSERVER_ENABLED=true in the environment to enable.")
+    return(invisible(FALSE))
+  }
+
+  if (nrow(analytics_df) == 0 || nrow(np_monthly_df) == 0) {
+    stop("SQL Server export aborted: KHIS data is empty")
+  }
+
+  np_monthly_table <- Sys.getenv("SQLSERVER_KHIS_TABLE", unset = "pmtct_np")
+
+  con <- DBI::dbConnect(
+    odbc::odbc(),
+    Driver = Sys.getenv("SQLSERVER_DRIVER", unset = "ODBC Driver 18 for SQL Server"),
+    Server = Sys.getenv("SQLSERVER_SERVER"),
+    Database = Sys.getenv("SQLSERVER_DATABASE"),
+    UID = Sys.getenv("SQLSERVER_UID"),
+    PWD = Sys.getenv("SQLSERVER_PWD"),
+    TrustServerCertificate = "yes"
+  )
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  np_monthly_id <- DBI::Id(schema = "dbo", table = np_monthly_table)
+  if (!DBI::dbExistsTable(con, np_monthly_id)) {
+    stop(sprintf("SQL Server table does not exist: %s.%s", sql_schema, np_monthly_table))
+  }
+
+  DBI::dbBegin(con)
+  tryCatch({
+    
+    DBI::dbExecute(
+      con,
+      paste("TRUNCATE TABLE", DBI::dbQuoteIdentifier(con, np_monthly_id))
+    )
+    DBI::dbAppendTable(con, np_monthly_id, np_monthly_df)
+
+    DBI::dbCommit(con)
+    log_message(sprintf("SQL Server export complete: %s.%s and %s.%s", sql_schema, analytics_table, sql_schema, np_monthly_table))
+    invisible(TRUE)
+  }, error = function(e) {
+    DBI::dbRollback(con)
+    stop(e)
   })
 }
 
@@ -656,6 +704,11 @@ colnames(np_monthly) = c("County", "SubCounty", "facilityname", "uid_khis", "mfl
 
 #writexl::write_xlsx(np_monthly, "np_monthly.xlsx")
 
+safe_run(
+  quote(write_khis_tables_to_sql_server(analytics, np_monthly)),
+  "Write KHIS Data to SQL Server"
+)
+
 #===============================================================================
 # 8. EXPORT OUTPUT
 #===============================================================================
@@ -668,104 +721,3 @@ safe_run(
   "Write Excel Output"
 )
 
-# wide_data_monthly <- np_monthly %>%
-#   # Pivot to wide format
-#   pivot_wider(
-#     names_from = month_year,
-#     values_from = total_new_pos,
-#     values_fill = 0,        # Fill NAs with 0
-#     names_repair = "unique" # Handle duplicate column names if any
-#   )
-# 
-# 
-# ##order columns
-# 
-# order_month_year_cols <- function(df) {
-# 
-#   cn <- names(df)
-# 
-#   # Identify month–year columns
-#   month_cols <- grepl("^[A-Za-z]+\\s*\\d{4}$", cn)
-# 
-#   # Convert column names to dates
-#   parsed_dates <- as.Date(
-#     paste0("1 ", cn[month_cols]),
-#     format = "%d %B %Y"
-#   )
-# 
-#   # Ordered indices of month columns
-#   month_idx <- which(month_cols)
-#   month_idx_ord <- month_idx[order(parsed_dates)]
-# 
-#   # Final column order
-#   new_order <- c(
-#     setdiff(seq_along(cn), month_idx),  # all other columns unchanged
-#     month_idx_ord                       # reordered month columns
-#   )
-# 
-#   df[, new_order, drop = FALSE]
-# }
-# 
-# 
-# wide_data_monthly_ordered <- order_month_year_cols(wide_data_monthly)
-# 
-# openxlsx::write.xlsx(wide_data_monthly_ordered, "monthly.xlsx")
-# 
-# # writexl::write_xlsx(wide_data_monthly_ordered,"monthly.xlsx")
-# 
-# names(df_ordered)
-# 
-# 
-# # Count facilities and months
-# summary_stats <- dash_values %>%
-#   summarise(
-#     n_facilities = n_distinct(facilityname),
-#     n_months = n_distinct(paste(Year, Month)),
-#     total_positives = sum(total_pos, na.rm = TRUE),
-#     avg_positives_per_facility = mean(total_pos, na.rm = TRUE)
-#   )
-# 
-# print(summary_stats)
-# 
-# #############################################################################
-# # SAVE ANALYTICS DATASET
-# #############################################################################
-# 
-# cat("Saving analytics dataset...\n")
-# analytics_data <- cleaned_data %>%
-#   select(
-#     county, sub_county, facility_name, facility_id, mfl_code,
-#     total_attending_anc1, total_known_pos, total_tested_anc1,
-#     total_tested_labour, total_tested_pnc, total_new_pos,
-#     total_positive, total_negative_anc1, total_negative_labour,
-#     total_negative_pnc, total_unk_status
-#   )
-# 
-# # Save analytics dataset
-# saveRDS(analytics_data, file.path(clean_data, "anc/pmtct_hiv_testing_data_county_analytics.rds"))
-# write.xlsx(
-#   analytics_data,
-#   file.path(clean_data, "anc/pmtct_hiv_testing_data_county_analytics_09122025.xlsx")
-# )
-# 
-# #############################################################################
-# # SAVE DASHBOARD DATASET
-# #############################################################################
-# 
-# cat("Saving dashboard dataset...\n")
-# dashboard_data <- cleaned_data %>%
-#   select(
-#     county, sub_county, facility_name, facility_id, mfl_code,
-#     np_october_2025 = total_pos_oct25,
-#     np_november_2025 = total_pos_nov25,
-#     overall_np = total_new_pos
-#   )
-# 
-# # Save dashboard dataset
-# saveRDS(dashboard_data, file.path(clean_data, "anc/pmtct_hiv_testing_data_county_his.rds"))
-# write.xlsx(
-#   dashboard_data,
-#   file.path(clean_data, "anc/pmtct_hiv_testing_data_county_his_09122025.xlsx")
-# )
-# 
-# 
