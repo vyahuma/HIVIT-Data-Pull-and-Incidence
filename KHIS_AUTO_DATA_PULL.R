@@ -55,24 +55,6 @@ log_message("SCRIPT STARTED")
 # 3. EMAIL ALERT FUNCTION
 #===============================================================================
 
-send_failure_email <- function(subject, body){
-  try({
-    if (!requireNamespace("blastula", quietly = TRUE)) {
-      return(invisible(FALSE))
-    }
-    email <- blastula::compose_email(body = blastula::md(body))
-    blastula::smtp_send(
-      email,
-      from = Sys.getenv("EMAIL_FROM"),
-      to   = Sys.getenv("EMAIL_TO"),
-      subject = subject,
-      credentials = blastula::creds(
-        user = Sys.getenv("EMAIL_USER"),
-        provider = "gmail"
-      )
-    )
-  }, silent = TRUE)
-}
 
 #===============================================================================
 # 4. SAFE EXECUTION WRAPPER
@@ -92,15 +74,6 @@ safe_run <- function(expr, step_name){
     
     log_message(paste("ERROR in", step_name, ":", err_msg), "ERROR")
     
-    send_failure_email(
-      subject = paste("KHIS Weekly FAILED:", step_name),
-      body = paste(
-        "KHIS Weekly Job Failed\n\n",
-        "Step:", step_name, "\n",
-        "Error:", err_msg, "\n\n",
-        "Log File:", LOG_FILE
-      )
-    )
     stop(paste("Execution halted at step:", step_name, "Error:", err_msg), call. = FALSE)
     # quit(save="no", status=1)
   })
