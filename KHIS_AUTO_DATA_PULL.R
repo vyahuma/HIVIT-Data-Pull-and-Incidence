@@ -18,9 +18,9 @@ if (!requireNamespace("pacman", quietly = TRUE)) {
 }
 library(pacman, lib.loc = shared_lib)
 # Use pacman to load and install packages
-pacman::p_load(rio, zoo, tidyverse, formattable, ggforce, ggthemes, RODBC, patchwork,tidytext, data.table, lubridate,
-               httr,curl,readxl,openxlsx,foreach,writexl, doParallel, jsonlite, future.apply, progress,  pbapply, future, furrr, progressr, promises,
-               purrr, DBI, odbc, RMySQL, RMariaDB,stringr)
+pacman::p_load(tidyverse,
+               httr, readxl, openxlsx, writexl, jsonlite,
+               purrr, DBI, odbc, stringr, blastula)
 
 #===============================================================================
 # 2. DIRECTORIES & LOGGING
@@ -57,13 +57,16 @@ log_message("SCRIPT STARTED")
 
 send_failure_email <- function(subject, body){
   try({
-    email <- compose_email(body = md(body))
-    smtp_send(
+    if (!requireNamespace("blastula", quietly = TRUE)) {
+      return(invisible(FALSE))
+    }
+    email <- blastula::compose_email(body = blastula::md(body))
+    blastula::smtp_send(
       email,
       from = Sys.getenv("EMAIL_FROM"),
       to   = Sys.getenv("EMAIL_TO"),
       subject = subject,
-      credentials = creds(
+      credentials = blastula::creds(
         user = Sys.getenv("EMAIL_USER"),
         provider = "gmail"
       )
@@ -85,24 +88,25 @@ safe_run <- function(expr, step_name){
     return(result)
     
   }, error = function(e){
+    err_msg <- conditionMessage(e)
     
-    log_message(paste("ERROR in", step_name, ":", e$message), "ERROR")
+    log_message(paste("ERROR in", step_name, ":", err_msg), "ERROR")
     
     send_failure_email(
       subject = paste("KHIS Weekly FAILED:", step_name),
       body = paste(
         "KHIS Weekly Job Failed\n\n",
         "Step:", step_name, "\n",
-        "Error:", e$message, "\n\n",
+        "Error:", err_msg, "\n\n",
         "Log File:", LOG_FILE
       )
     )
-    
-    quit(save="no", status=1)
+    stop(paste("Execution halted at step:", step_name, "Error:", err_msg), call. = FALSE)
+    # quit(save="no", status=1)
   })
 }
 
-write_khis_tables_to_sql_server <- function(analytics_df, np_monthly_df) {
+write_khis_tables_to_sql_server <- function(np_monthly_df) {
   sql_enabled <- tolower(Sys.getenv("SQLSERVER_ENABLED", unset = "false")) %in% c("true", "1", "yes", "y")
 
   if (!sql_enabled) {
@@ -110,10 +114,11 @@ write_khis_tables_to_sql_server <- function(analytics_df, np_monthly_df) {
     return(invisible(FALSE))
   }
 
-  if (nrow(analytics_df) == 0 || nrow(np_monthly_df) == 0) {
+  if (nrow(np_monthly_df) == 0) {
     stop("SQL Server export aborted: KHIS data is empty")
   }
 
+  sql_schema <- Sys.getenv("SQLSERVER_SCHEMA", unset = "dbo")
   np_monthly_table <- Sys.getenv("SQLSERVER_KHIS_TABLE", unset = "pmtct_np")
 
   con <- DBI::dbConnect(
@@ -127,7 +132,7 @@ write_khis_tables_to_sql_server <- function(analytics_df, np_monthly_df) {
   )
   on.exit(DBI::dbDisconnect(con), add = TRUE)
 
-  np_monthly_id <- DBI::Id(schema = "dbo", table = np_monthly_table)
+  np_monthly_id <- DBI::Id(schema = sql_schema, table = np_monthly_table)
   if (!DBI::dbExistsTable(con, np_monthly_id)) {
     stop(sprintf("SQL Server table does not exist: %s.%s", sql_schema, np_monthly_table))
   }
@@ -142,7 +147,7 @@ write_khis_tables_to_sql_server <- function(analytics_df, np_monthly_df) {
     DBI::dbAppendTable(con, np_monthly_id, np_monthly_df)
 
     DBI::dbCommit(con)
-    log_message(sprintf("SQL Server export complete: %s.%s and %s.%s", sql_schema, analytics_table, sql_schema, np_monthly_table))
+    log_message(sprintf("SQL Server export complete: %s.%s", sql_schema, np_monthly_table))
     invisible(TRUE)
   }, error = function(e) {
     DBI::dbRollback(con)
@@ -704,11 +709,6 @@ colnames(np_monthly) = c("County", "SubCounty", "facilityname", "uid_khis", "mfl
 
 #writexl::write_xlsx(np_monthly, "np_monthly.xlsx")
 
-safe_run(
-  quote(write_khis_tables_to_sql_server(analytics, np_monthly)),
-  "Write KHIS Data to SQL Server"
-)
-
 #===============================================================================
 # 8. EXPORT OUTPUT
 #===============================================================================
@@ -721,3 +721,12 @@ safe_run(
   "Write Excel Output"
 )
 
+#===============================================================================
+# Write TO SQL Server
+#===============================================================================
+
+safe_run(
+  quote(write_khis_tables_to_sql_server(np_monthly)),
+  "Write KHIS Data to SQL Server"
+)
+log_message("SCRIPT COMPLETED SUCCESSFULLY")
