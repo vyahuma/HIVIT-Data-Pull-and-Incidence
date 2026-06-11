@@ -20,7 +20,7 @@ library(pacman, lib.loc = shared_lib)
 # Use pacman to load and install packages
 pacman::p_load(tidyverse,
                httr, readxl, openxlsx, writexl, jsonlite,
-               purrr, DBI, odbc, stringr, blastula)
+               purrr, DBI, odbc, stringr, lubridate, blastula)
 
 #===============================================================================
 # 2. DIRECTORIES & LOGGING
@@ -51,13 +51,9 @@ log_message <- function(msg, type="INFO"){
 
 log_message("SCRIPT STARTED")
 
-#===============================================================================
-# 3. EMAIL ALERT FUNCTION
-#===============================================================================
-
 
 #===============================================================================
-# 4. SAFE EXECUTION WRAPPER
+# SAFE EXECUTION WRAPPER
 #===============================================================================
 
 safe_run <- function(expr, step_name){
@@ -79,6 +75,35 @@ safe_run <- function(expr, step_name){
   })
 }
 
+connect_sql_server <- function() {
+  required_vars <- c(
+    "SQLSERVER_SERVER",
+    "SQLSERVER_DATABASE",
+    "SQLSERVER_UID",
+    "SQLSERVER_PWD"
+  )
+  missing_vars <- required_vars[vapply(required_vars, function(var) {
+    identical(Sys.getenv(var), "")
+  }, logical(1))]
+
+  if (length(missing_vars) > 0) {
+    stop(sprintf(
+      "SQL Server export aborted: missing environment variable(s): %s",
+      paste(missing_vars, collapse = ", ")
+    ))
+  }
+
+  DBI::dbConnect(
+    odbc::odbc(),
+    Driver = Sys.getenv("SQLSERVER_DRIVER", unset = "ODBC Driver 17 for SQL Server"),
+    Server = Sys.getenv("SQLSERVER_SERVER"),
+    Database = Sys.getenv("SQLSERVER_DATABASE"),
+    UID = Sys.getenv("SQLSERVER_UID"),
+    PWD = Sys.getenv("SQLSERVER_PWD"),
+    TrustServerCertificate = Sys.getenv("SQLSERVER_TRUST_SERVER_CERTIFICATE", unset = "yes")
+  )
+}
+
 write_khis_tables_to_sql_server <- function(np_monthly_df) {
   sql_enabled <- tolower(Sys.getenv("SQLSERVER_ENABLED", unset = "false")) %in% c("true", "1", "yes", "y")
 
@@ -92,17 +117,9 @@ write_khis_tables_to_sql_server <- function(np_monthly_df) {
   }
 
   sql_schema <- Sys.getenv("SQLSERVER_SCHEMA", unset = "dbo")
-  np_monthly_table <- Sys.getenv("SQLSERVER_KHIS_TABLE", unset = "pmtct_np")
+  np_monthly_table <- Sys.getenv("SQLSERVER_NP_MONTHLY_TABLE", unset = "pmtct_np")
 
-  con <- DBI::dbConnect(
-    odbc::odbc(),
-    Driver = Sys.getenv("SQLSERVER_DRIVER", unset = "ODBC Driver 18 for SQL Server"),
-    Server = Sys.getenv("SQLSERVER_SERVER"),
-    Database = Sys.getenv("SQLSERVER_DATABASE"),
-    UID = Sys.getenv("SQLSERVER_UID"),
-    PWD = Sys.getenv("SQLSERVER_PWD"),
-    TrustServerCertificate = "yes"
-  )
+  con <- connect_sql_server()
   on.exit(DBI::dbDisconnect(con), add = TRUE)
 
   np_monthly_id <- DBI::Id(schema = sql_schema, table = np_monthly_table)
@@ -128,8 +145,112 @@ write_khis_tables_to_sql_server <- function(np_monthly_df) {
   })
 }
 
+write_vl_api_data_to_sql_server <- function(vl_api_df) {
+  sql_enabled <- tolower(Sys.getenv("SQLSERVER_ENABLED", unset = "false")) %in% c("true", "1", "yes", "y")
+
+  if (!sql_enabled) {
+    log_message("SQL Server export skipped because SQLSERVER_ENABLED is not true or is not set. Set SQLSERVER_ENABLED=true in the environment to enable.")
+    return(invisible(FALSE))
+  }
+
+  if (nrow(vl_api_df) == 0) {
+    stop("SQL Server export aborted: VL API data is empty")
+  }
+
+  sql_schema <- Sys.getenv("SQLSERVER_SCHEMA", unset = "dbo")
+  vl_table <- Sys.getenv("SQLSERVER_VL_TABLE", unset = "lag")
+
+  con <- connect_sql_server()
+  on.exit(DBI::dbDisconnect(con), add = TRUE)
+
+  vl_id <- DBI::Id(schema = sql_schema, table = vl_table)
+  if (!DBI::dbExistsTable(con, vl_id)) {
+    stop(sprintf("SQL Server table does not exist: %s.%s", sql_schema, vl_table))
+  }
+
+  DBI::dbBegin(con)
+  tryCatch({
+    
+    DBI::dbExecute(
+      con,
+      paste("TRUNCATE TABLE", DBI::dbQuoteIdentifier(con, vl_id))
+    )
+    DBI::dbAppendTable(con, vl_id, vl_api_df)
+
+    DBI::dbCommit(con)
+    log_message(sprintf("SQL Server export complete: %s.%s", sql_schema, vl_table))
+    invisible(TRUE)
+  }, error = function(e) {
+    DBI::dbRollback(con)
+    stop(e)
+  })
+}
+
 #===============================================================================
-# create functions
+# create functions Recency API
+#===============================================================================
+
+get_recency_vl_data <- function() {
+  api_url <- Sys.getenv("RECENCY_API_URL", unset = "https://eiddash.nascop.org/api/recency/lag")
+ 
+  recency_api_key <- Sys.getenv("RECENCY_API_KEY")
+if (identical(recency_api_key, "")) {
+  stop("Missing RECENCY_API_KEY environment variable. Set it before running this script.")
+}
+
+  
+  mapping_file <- file.path(BASE_DIR, "lag_mapping.csv")
+
+
+  # Read mapping file
+  mapping <- read_csv(mapping_file, show_col_types = FALSE)
+
+  # Read API
+  response <- GET(
+    api_url,
+    add_headers(apikey = recency_api_key)
+  )
+
+  if (status_code(response) != 200) {
+    stop(paste("API failed with status:", status_code(response)))
+  }
+
+  json_text <- content(response, as = "text", encoding = "UTF-8")
+  raw_data <- fromJSON(json_text, flatten = TRUE)
+
+  raw_data <- as.data.frame(raw_data)
+
+  # Build SQL-ready data frame
+  recency_data_df <- data.frame()
+
+  for (i in seq_len(nrow(mapping))) {
+    sql_col <- mapping$sql_column[i]
+    json_col <- mapping$json_column[i]
+    r_type <- mapping$r_type[i]
+
+    if (json_col %in% names(raw_data)) {
+      value <- raw_data[[json_col]]
+    } else {
+      value <- NA
+    }
+
+    if (r_type == "numeric") {
+      value <- as.numeric(value)
+    } else if (r_type == "date") {
+      value <- as.Date(value)
+    } else if (r_type == "datetime") {
+      value <- ymd_hms(value, quiet = TRUE)
+    } else {
+      value <- as.character(value)
+    }
+
+    recency_data_df[[sql_col]] <- value
+  }
+  return(recency_data_df)
+}
+
+#===============================================================================
+# create functions KHIS
 #===============================================================================
 
 # Metadata function
@@ -695,11 +816,21 @@ safe_run(
 )
 
 #===============================================================================
-# Write TO SQL Server
+# Write KHIS DATA TO SQL Server
 #===============================================================================
 
 safe_run(
   quote(write_khis_tables_to_sql_server(np_monthly)),
   "Write KHIS Data to SQL Server"
 )
+
+#===============================================================================
+# Write Recency DATA TO SQL Server
+#===============================================================================
+
+safe_run(
+  quote(write_vl_api_data_to_sql_server(get_recency_vl_data())),
+  "Write Recency VL Data to SQL Server"
+)
+
 log_message("SCRIPT COMPLETED SUCCESSFULLY")
