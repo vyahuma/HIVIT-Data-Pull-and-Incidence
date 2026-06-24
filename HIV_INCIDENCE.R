@@ -1859,7 +1859,8 @@ incidence_out_path <- file.path(EXTERNAL_OUTPUT_DIR,"hivit_incidence.xlsx")
 writexl::write_xlsx(
   list(
     County_Results = report_table,
-    Data_Dictionary = data_dictionary
+    Data_Dictionary = data_dictionary,
+    Combined_Recency_Tested = pooled_all_summary
   ),
   incidence_out_path
 )
