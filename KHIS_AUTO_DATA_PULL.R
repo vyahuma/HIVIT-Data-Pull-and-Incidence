@@ -220,8 +220,12 @@ if (identical(recency_api_key, "")) {
 
   raw_data <- as.data.frame(raw_data)
 
-  # Build SQL-ready data frame
-  recency_data_df <- data.frame()
+  if (nrow(raw_data) == 0) {
+    stop("Recency API returned no rows")
+  }
+
+  # Build SQL-ready data frame with one row per API record.
+  recency_data_df <- data.frame(row.names = seq_len(nrow(raw_data)))
 
   for (i in seq_len(nrow(mapping))) {
     sql_col <- mapping$sql_column[i]
