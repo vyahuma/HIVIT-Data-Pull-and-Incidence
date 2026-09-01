@@ -1,6 +1,7 @@
 sql_column,json_column,r_type
 id,id,numeric
 dob,dob,character
+hashed_ccc,hashed_ccc,character
 facility_mfl_code,facility_mfl_code,numeric
 facility_name,facility_name,character
 county,county,character
