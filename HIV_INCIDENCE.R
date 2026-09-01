@@ -19,7 +19,8 @@
 #   - Proportion RITA Recent: R / (HIV-negative + R)
 #   - Incidence: Uses inctools::incprops with protocol-specified parameters
 #   - MDRI = 130 days (95% CI: 118-142)
-#   - FRR = 0.00 (false recent rate)
+#   - Protocol FRR = 0.00 (false recent rate)
+#   - FRR = 0.004 as a proportion (0.4%) added as a workbook sensitivity estimate
 #   - Time cutoff (BigT) = 365 days
 #
 # REQUIRED INPUT DATA:
@@ -53,8 +54,7 @@
 # File Paths
 # -----------------------------------------------------------------------------
 # Update these paths to point to your actual data files
-# Directory where the required packages will be installed
-shared_lib <- Sys.getenv("R_LIBS_USER")
+
 
 # -----------------------------------------------------------------------------
 # Protocol Parameters for Incidence Estimation
@@ -69,7 +69,11 @@ MDRI_DAYS   <- 130
 MDRI_CI     <- c(118, 142)
 
 # False Recent Rate (proportion of long-term infections misclassified as recent)
-FRR         <- 0.00
+# Protocol assumption is FRR = 0.00; a 0.004 proportion (0.4%) sensitivity
+# estimate is carried in the workbook for review.
+FRR_PROTOCOL   <- 0.00
+FRR_SENSITIVITY <- 0.004
+FRR            <- FRR_PROTOCOL
 
 # Relative Standard Error for FRR (required by inctools even when FRR=0)
 RSE_FRR     <- 0.20
@@ -215,12 +219,22 @@ first_non_missing_chr <- function(x) {
     as.character() %>%
     stringr::str_trim()
   vals <- vals[!is.na(vals) & vals != ""]
-
+  
   if (length(vals) == 0) {
     return(NA_character_)
   }
-
+  
   vals[1]
+}
+
+format_incidence_per_100k <- function(incidence_percent) {
+  out <- rep(NA_character_, length(incidence_percent))
+  valid <- !is.na(incidence_percent)
+  out[valid] <- paste0(
+    formatC(incidence_percent[valid] * 1000, format = "f", digits = 0, big.mark = ","),
+    " per 100,000"
+  )
+  out
 }
 
 normalize_facility_name <- function(x) {
@@ -240,20 +254,20 @@ build_name_match_suggestions <- function(unmatched_df, ref_df, top_n = 3) {
   if (nrow(unmatched_df) == 0 || nrow(ref_df) == 0) {
     return(tibble::tibble())
   }
-
+  
   purrr::map_dfr(seq_len(nrow(unmatched_df)), function(i) {
     row <- unmatched_df[i, , drop = FALSE]
     recency_name_norm <- normalize_facility_name(row$recency_facility_name)
     recency_county_std <- gsub(" County$", "", as.character(row$recency_county))
-
+    
     candidate_pool <- ref_df
     same_county_pool <- ref_df %>%
       dplyr::filter(khis_county_std == recency_county_std)
-
+    
     if (nrow(same_county_pool) > 0) {
       candidate_pool <- same_county_pool
     }
-
+    
     candidate_pool <- candidate_pool %>%
       dplyr::mutate(
         name_distance = utils::adist(recency_name_norm, khis_name_norm)[1, ],
@@ -261,7 +275,7 @@ build_name_match_suggestions <- function(unmatched_df, ref_df, top_n = 3) {
       ) %>%
       dplyr::arrange(name_distance, dplyr::desc(county_match), facilityname) %>%
       dplyr::slice_head(n = top_n)
-
+    
     suggestion_row <- tibble::tibble(
       recency_mfl = row$mfl,
       recency_facility_name = row$recency_facility_name,
@@ -270,7 +284,7 @@ build_name_match_suggestions <- function(unmatched_df, ref_df, top_n = 3) {
       N_testR_site = row$N_testR_site,
       N_R_site = row$N_R_site
     )
-
+    
     for (j in seq_len(top_n)) {
       if (j <= nrow(candidate_pool)) {
         suggestion_row[[paste0("suggestion_", j, "_mfl")]] <- candidate_pool$mfl[j]
@@ -288,7 +302,7 @@ build_name_match_suggestions <- function(unmatched_df, ref_df, top_n = 3) {
         suggestion_row[[paste0("suggestion_", j, "_name_distance")]] <- NA_real_
       }
     }
-
+    
     suggestion_row
   })
 }
@@ -320,20 +334,20 @@ to_numeric_safe <- function(x) {
 normalize_vl <- function(x) {
   raw <- stringr::str_trim(as.character(x))
   raw_upper <- toupper(raw)
-
+  
   below_limit <- grepl("^\\s*<", raw) |
     grepl("LDL|BELOW DETECTION|NOT DETECTED|TARGET NOT DETECTED|UNDETECTABLE", raw_upper)
   above_limit <- grepl("^\\s*>", raw)
-
+  
   numeric_token <- stringr::str_extract(
     stringr::str_replace_all(raw, ",", ""),
     "\\d+(?:\\.\\d+)?"
   )
   parsed <- suppressWarnings(as.numeric(numeric_token))
-
+  
   parsed[below_limit] <- 0
   parsed[above_limit] <- 100000
-
+  
   parsed
 }
 
@@ -461,43 +475,71 @@ add_overall <- function(df, strata_cols, sum_cols) {
 library(httr)
 library(dplyr)
 
-url <- Sys.getenv("RECENCY_API_URL", unset = "https://eiddash.nascop.org/api/recency/lag")
-if (identical(url, "")) {
-  stop("Missing RECENCY_API_URL environment variable. Set it in .Renviron before running this script.")
-}
+use_saved_recency_data <- toupper(Sys.getenv("RECENCY_USE_SAVED_DATA", unset = "FALSE")) %in%
+  c("TRUE", "T", "YES", "Y", "1")
 
-recency_api_key <- Sys.getenv("RECENCY_API_KEY")
-if (identical(recency_api_key, "")) {
-  stop("Missing RECENCY_API_KEY environment variable. Set it before running this script.")
-}
-
-# Send request with API key
-response <- GET(
-  url,
-  add_headers(apikey = recency_api_key)
-)
-
-# Convert response to text
-json_data <- content(response, as = "text", encoding = "UTF-8")
-
-if (httr::status_code(response) < 200 || httr::status_code(response) >= 300) {
-  stop(
-    sprintf(
-      "Recency API request failed [%s] for %s. Response: %s",
-      httr::status_code(response),
-      url,
-      substr(json_data, 1, 500)
-    )
-  )
-}
-
-# Parse JSON
-recency_raw <- tryCatch(
-  jsonlite::fromJSON(json_data, flatten = TRUE),
-  error = function(e) {
-    stop(sprintf("Failed to parse recency API response for %s: %s", url, e$message))
+if (use_saved_recency_data) {
+  recency_saved_path <- Sys.getenv("RECENCY_SAVED_RDATA", unset = ".RData")
+  
+  if (!file.exists(recency_saved_path)) {
+    stop("Saved recency data requested but file does not exist: ", recency_saved_path)
   }
-)
+  
+  saved_recency_env <- new.env(parent = emptyenv())
+  load(recency_saved_path, envir = saved_recency_env)
+  
+  if (exists("recency_raw", envir = saved_recency_env, inherits = FALSE)) {
+    recency_raw <- get("recency_raw", envir = saved_recency_env, inherits = FALSE)
+    recency_source_label <- paste0("saved recency_raw from ", recency_saved_path)
+  } else if (exists("recency", envir = saved_recency_env, inherits = FALSE)) {
+    recency_raw <- get("recency", envir = saved_recency_env, inherits = FALSE)
+    recency_source_label <- paste0("saved recency from ", recency_saved_path)
+  } else {
+    stop("Saved recency file must contain either recency_raw or recency: ", recency_saved_path)
+  }
+  
+  cat("Loaded recency data from", recency_source_label, "\n")
+} else {
+  url <- Sys.getenv("RECENCY_API_URL", unset = "https://eiddash.nascop.org/api/recency/lag")
+  if (identical(url, "")) {
+    stop("Missing RECENCY_API_URL environment variable. Set it in .Renviron before running this script.")
+  }
+  
+  recency_api_key <- Sys.getenv("RECENCY_API_KEY")
+  if (identical(recency_api_key, "")) {
+    stop("Missing RECENCY_API_KEY environment variable. Set it before running this script.")
+  }
+  
+  # Send request with API key
+  response <- GET(
+    url,
+    add_headers(apikey = recency_api_key)
+  )
+  
+  # Convert response to text
+  json_data <- content(response, as = "text", encoding = "UTF-8")
+  
+  if (httr::status_code(response) < 200 || httr::status_code(response) >= 300) {
+    stop(
+      sprintf(
+        "Recency API request failed [%s] for %s. Response: %s",
+        httr::status_code(response),
+        url,
+        substr(json_data, 1, 500)
+      )
+    )
+  }
+  
+  # Parse JSON
+  recency_raw <- tryCatch(
+    jsonlite::fromJSON(json_data, flatten = TRUE),
+    error = function(e) {
+      stop(sprintf("Failed to parse recency API response for %s: %s", url, e$message))
+    }
+  )
+  
+  recency_source_label <- paste0("API: ", url)
+}
 
 recency_raw <- clean_names_safe(as.data.frame(recency_raw))
 
@@ -680,12 +722,12 @@ recency <- recency_raw %>%
       # Long-term: LAg recent (ODn ≤ 1.5) but VL < 1000
       !is.na(lag_odn_value) & lag_odn_value <= 1.5 &
         !is.na(nnew_vl) & nnew_vl < 1000 ~ "LONGTERM",
-
+      
       ((lag_result_std %in% recent_labels) |
          (lag_status_std %in% recent_labels) |
          (lag_prelim_std %in% recent_labels)) &
         !is.na(nnew_vl) & nnew_vl >= 1000 ~ "RECENT",
-
+      
       ((lag_result_std %in% recent_labels) |
          (lag_status_std %in% recent_labels) |
          (lag_prelim_std %in% recent_labels)) &
@@ -732,20 +774,19 @@ matched_preart_vl_site_mfl <- recency_site_summary %>%
 #--------------------------------------------------------------
 #analytics data comes from KHIS pulling
 #--------------------------------------------------------------
-# analytics_rds_path <- Sys.getenv("ANC_ANALYTICS_RDS", unset = file.path("output", "analytics_latest.rds"))
-BASE_DIR <- Sys.getenv("KHIS_BASE_DIR", unset = ".")
-analytics_rds_path <- file.path(BASE_DIR, "output", "analytics_latest.rds")
+
+analytics_rds_path <- Sys.getenv("ANC_ANALYTICS_RDS", unset = file.path("output", "analytics_latest.rds"))
 if (!exists("analytics")) {
   if (!file.exists(analytics_rds_path)) {
     stop(
       paste0(
         "'analytics' object not found and persisted analytics file is missing at: ",
         analytics_rds_path,
-        ". Run KHIS_AUTO_DATA_PULL.R first or ensure the analytics_latest.rds file exists in the output folder"
+        ". Run KHIS_AUTO_DATA_PULL.R first or set ANC_ANALYTICS_RDS to a valid .rds file."
       )
     )
   }
-
+  
   analytics <- readRDS(analytics_rds_path)
   cat("Loaded analytics dataset from:", analytics_rds_path, "\n")
 }
@@ -779,7 +820,7 @@ if (!file.exists(mfl_lookup_path)) {
     "MFL_LOOKUP_CSV",
     unset = file.path("documents", "MFLCODE_KHIS_latest_26022026.xlsx.csv")
   )
-
+  
   if (file.exists(legacy_lookup_path)) {
     mfl_lookup_path <- legacy_lookup_path
   }
@@ -799,22 +840,22 @@ mfl_master_reference <- tibble::tibble(
 
 if (file.exists(mfl_lookup_path)) {
   lookup_ext <- tolower(tools::file_ext(mfl_lookup_path))
-
+  
   mfl_lookup <- if (lookup_ext %in% c("xlsx", "xls")) {
     readxl::read_excel(mfl_lookup_path)
   } else {
     readr::read_csv(mfl_lookup_path, show_col_types = FALSE)
   }
-
+  
   mfl_lookup <- clean_names_safe(mfl_lookup)
-
+  
   col_mfl_lookup <- first_existing(mfl_lookup, c("code", "mfl"), required = FALSE)
   col_county_lookup <- first_existing(mfl_lookup, c("county"), required = FALSE)
   col_subcounty_lookup <- first_existing(mfl_lookup, c("sub_county", "subcounty"), required = FALSE)
   col_name_lookup <- first_existing(mfl_lookup, c("officialname", "official_name", "name"), required = FALSE)
   col_official_lookup <- first_existing(mfl_lookup, c("officialname", "official_name"), required = FALSE)
   col_closed_lookup <- first_existing(mfl_lookup, c("closed", "operation_status"), required = FALSE)
-
+  
   mfl_master_reference <- mfl_lookup %>%
     dplyr::transmute(
       mfl = readr::parse_number(as.character(.data[[col_mfl_lookup]])),
@@ -838,8 +879,25 @@ facility_name_reference <- dplyr::bind_rows(
   dplyr::distinct(reference_source, mfl, .keep_all = TRUE)
 
 all_anc1_prevalence <- analytics %>%
+  dplyr::mutate(
+    khis_anc1_reported = rowSums(
+      dplyr::across(
+        dplyr::any_of(c(
+          "total_attending_anc1",
+          "total_tested_anc1",
+          "total_known_serostatus_anc1",
+          "total_positive_anc1",
+          "total_new_pos_anc1",
+          "total_known_pos"
+        )),
+        \(x) tidyr::replace_na(as.numeric(x), 0)
+      ),
+      na.rm = TRUE
+    ) > 0
+  ) %>%
   dplyr::group_by(County) %>%
   dplyr::summarise(
+    N_Sites_Reporting_KHIS_ANC1 = dplyr::n_distinct(mfl[!is.na(mfl) & khis_anc1_reported]),
     All_ANC1_N_Known = sum(total_known_serostatus_anc1, na.rm = TRUE),
     All_ANC1_N_HIV_Positive = sum(total_positive_anc1, na.rm = TRUE),
     All_ANC1_HIV_Prevalence = dplyr::if_else(
@@ -869,31 +927,22 @@ if (length(matched_preart_vl_site_mfl) == 0) {
   )
 }
 
-khis_preart_vl_sites <- analytics %>%
-  dplyr::filter(!is.na(mfl), mfl %in% matched_preart_vl_site_mfl) %>%
-  dplyr::left_join(recency_site_summary, by = c("mfl" = "site_mfl")) %>%
-  dplyr::select(
-    County,
-    SubCounty,
-    facilityname,
-    uid_khis,
-    mfl,
-    recency_facility_name,
-    recency_county,
-    recency_records_all,
-    N_testR_site,
-    N_R_site,
-    total_attending_anc1,
-    total_tested_anc1,
-    total_known_pos,
-    total_new_pos_anc1,
-    total_positive_anc1,
-    total_known_serostatus_anc1
-  ) %>%
-  dplyr::arrange(County, SubCounty, facilityname)
+khis_mfl_reference <- analytics %>%
+  dplyr::filter(!is.na(mfl)) %>%
+  dplyr::distinct(khis_mfl = mfl)
 
-unmatched_preart_vl_sites <- recency_site_summary %>%
-  dplyr::filter(!site_mfl %in% unique(khis_preart_vl_sites$mfl)) %>%
+direct_site_links <- recency_site_summary %>%
+  dplyr::inner_join(khis_mfl_reference, by = c("site_mfl" = "khis_mfl")) %>%
+  dplyr::transmute(
+    recency_mfl = site_mfl,
+    khis_mfl = site_mfl,
+    match_type = "direct_mfl",
+    match_note = "Recency MFL matched KHIS analytics MFL"
+  ) %>%
+  dplyr::distinct(recency_mfl, khis_mfl, .keep_all = TRUE)
+
+initial_unmatched_preart_vl_sites <- recency_site_summary %>%
+  dplyr::anti_join(direct_site_links, by = c("site_mfl" = "recency_mfl")) %>%
   dplyr::transmute(
     mfl = site_mfl,
     recency_facility_name,
@@ -905,7 +954,7 @@ unmatched_preart_vl_sites <- recency_site_summary %>%
   dplyr::arrange(recency_county, recency_facility_name)
 
 unmatched_preart_vl_site_suggestions <- build_name_match_suggestions(
-  unmatched_preart_vl_sites,
+  initial_unmatched_preart_vl_sites,
   facility_name_reference,
   top_n = 3
 ) %>%
@@ -934,11 +983,176 @@ unmatched_preart_vl_site_suggestions <- build_name_match_suggestions(
   ) %>%
   dplyr::arrange(recency_county, recency_facility_name)
 
+crosswalk_path <- Sys.getenv(
+  "PREART_VL_KHIS_CROSSWALK",
+  unset = file.path("documents", "preart_vl_khis_facility_crosswalk.csv")
+)
+
+facility_match_crosswalk <- tibble::tibble(
+  recency_mfl = numeric(),
+  khis_mfl = numeric(),
+  include_in_incidence = logical(),
+  match_note = character()
+)
+
+if (file.exists(crosswalk_path)) {
+  crosswalk_raw <- readr::read_csv(crosswalk_path, show_col_types = FALSE) %>%
+    clean_names_safe()
+  
+  col_crosswalk_recency_mfl <- first_existing(
+    crosswalk_raw,
+    c("recency_mfl", "recency_site_mfl", "source_mfl", "mfl"),
+    required = FALSE
+  )
+  col_crosswalk_khis_mfl <- first_existing(
+    crosswalk_raw,
+    c("khis_mfl", "matched_khis_mfl", "target_mfl", "include_khis_mfl"),
+    required = FALSE
+  )
+  col_crosswalk_include <- first_existing(
+    crosswalk_raw,
+    c("include_in_incidence", "include", "approved", "use_match"),
+    required = FALSE
+  )
+  col_crosswalk_note <- first_existing(
+    crosswalk_raw,
+    c("match_note", "note", "notes", "comment"),
+    required = FALSE
+  )
+  
+  if (!is.na(col_crosswalk_recency_mfl) &&
+      !is.na(col_crosswalk_khis_mfl) &&
+      !is.na(col_crosswalk_include)) {
+    facility_match_crosswalk <- crosswalk_raw %>%
+      dplyr::transmute(
+        recency_mfl = readr::parse_number(as.character(.data[[col_crosswalk_recency_mfl]])),
+        khis_mfl = readr::parse_number(as.character(.data[[col_crosswalk_khis_mfl]])),
+        include_in_incidence = toupper(trimws(as.character(.data[[col_crosswalk_include]]))) %in%
+          c("TRUE", "T", "YES", "Y", "1"),
+        match_note = if (!is.na(col_crosswalk_note)) as.character(.data[[col_crosswalk_note]]) else NA_character_
+      ) %>%
+      dplyr::filter(!is.na(recency_mfl), !is.na(khis_mfl)) %>%
+      dplyr::distinct(recency_mfl, khis_mfl, .keep_all = TRUE)
+  } else {
+    warning(
+      paste0(
+        "Facility match crosswalk was found at ", crosswalk_path,
+        " but must contain recency_mfl, khis_mfl, and include_in_incidence columns. ",
+        "No reviewed facility matches were applied."
+      )
+    )
+  }
+}
+
+reviewed_site_links <- facility_match_crosswalk %>%
+  dplyr::filter(include_in_incidence) %>%
+  dplyr::semi_join(initial_unmatched_preart_vl_sites, by = c("recency_mfl" = "mfl")) %>%
+  dplyr::semi_join(khis_mfl_reference, by = "khis_mfl") %>%
+  dplyr::transmute(
+    recency_mfl,
+    khis_mfl,
+    match_type = "reviewed_crosswalk",
+    match_note = dplyr::coalesce(match_note, "Reviewed recency-to-KHIS facility match")
+  )
+
+included_site_links <- dplyr::bind_rows(
+  direct_site_links,
+  reviewed_site_links
+) %>%
+  dplyr::distinct(recency_mfl, khis_mfl, .keep_all = TRUE)
+
+included_recency_site_mfl <- unique(included_site_links$recency_mfl)
+
+included_recency_summary_by_khis <- included_site_links %>%
+  dplyr::left_join(recency_site_summary, by = c("recency_mfl" = "site_mfl")) %>%
+  dplyr::group_by(khis_mfl) %>%
+  dplyr::summarise(
+    recency_mfls = paste(sort(unique(recency_mfl)), collapse = "; "),
+    recency_facility_name = paste(sort(unique(stats::na.omit(recency_facility_name))), collapse = "; "),
+    recency_county = first_non_missing_chr(recency_county),
+    recency_records_all = sum(recency_records_all, na.rm = TRUE),
+    N_testR_site = sum(N_testR_site, na.rm = TRUE),
+    N_R_site = sum(N_R_site, na.rm = TRUE),
+    match_type = paste(sort(unique(match_type)), collapse = "; "),
+    match_note = paste(sort(unique(stats::na.omit(match_note))), collapse = "; "),
+    .groups = "drop"
+  )
+
+khis_preart_vl_sites <- analytics %>%
+  dplyr::filter(!is.na(mfl), mfl %in% unique(included_site_links$khis_mfl)) %>%
+  dplyr::left_join(included_recency_summary_by_khis, by = c("mfl" = "khis_mfl")) %>%
+  dplyr::select(
+    County,
+    SubCounty,
+    facilityname,
+    uid_khis,
+    mfl,
+    recency_mfls,
+    match_type,
+    match_note,
+    recency_facility_name,
+    recency_county,
+    recency_records_all,
+    N_testR_site,
+    N_R_site,
+    total_attending_anc1,
+    total_tested_anc1,
+    total_known_pos,
+    total_new_pos_anc1,
+    total_positive_anc1,
+    total_known_serostatus_anc1
+  ) %>%
+  dplyr::arrange(County, SubCounty, facilityname)
+
+unmatched_preart_vl_sites <- recency_site_summary %>%
+  dplyr::filter(!site_mfl %in% included_recency_site_mfl) %>%
+  dplyr::transmute(
+    mfl = site_mfl,
+    recency_facility_name,
+    recency_county,
+    recency_records_all,
+    N_testR_site,
+    N_R_site
+  ) %>%
+  dplyr::arrange(recency_county, recency_facility_name)
+
+facility_match_review <- unmatched_preart_vl_site_suggestions %>%
+  dplyr::left_join(
+    facility_match_crosswalk %>%
+      dplyr::transmute(
+        recency_mfl,
+        reviewed_khis_mfl = khis_mfl,
+        include_in_incidence = include_in_incidence,
+        reviewed_match_note = match_note
+      ),
+    by = "recency_mfl"
+  ) %>%
+  dplyr::mutate(
+    include_in_incidence = tidyr::replace_na(include_in_incidence, FALSE),
+    review_status = dplyr::case_when(
+      recency_mfl %in% reviewed_site_links$recency_mfl ~ "Applied to incidence denominator",
+      include_in_incidence ~ "Requested but not applied; KHIS MFL or recency MFL not found",
+      TRUE ~ "Needs review"
+    )
+  ) %>%
+  dplyr::relocate(review_status, reviewed_khis_mfl, include_in_incidence, reviewed_match_note, .after = recency_county)
+
+unmatched_preart_vl_site_suggestions <- facility_match_review %>%
+  dplyr::semi_join(unmatched_preart_vl_sites, by = c("recency_mfl" = "mfl"))
+
 cat(
   "Restricting incidence HIV-negative denominator to",
   dplyr::n_distinct(khis_preart_vl_sites$mfl),
   "matched pre-ART VL-contributing KHIS ANC sites.\n"
 )
+cat(
+  "  Linked recency pre-ART VL facilities:",
+  dplyr::n_distinct(included_recency_site_mfl),
+  "of",
+  dplyr::n_distinct(recency_site_summary$site_mfl),
+  "\n"
+)
+cat("  Reviewed facility crosswalk links applied:", nrow(reviewed_site_links), "\n")
 
 has_protocol_anc1_cols <- all(
   c("total_new_pos_anc1", "total_positive_anc1", "total_known_serostatus_anc1") %in% names(analytics)
@@ -974,32 +1188,29 @@ anc1_negative <- if ("total_negative_anc1" %in% names(analytics)) {
   anc1_known_serostatus - anc1_positive
 }
 
-cat("Using protocol ANC1-only prevalence inputs at county level.\n")
-cat("Restricting incidence HIV-negative denominator to KHIS ANC sites with matched pre-ART VL contribution.\n")
+cat("Using protocol ANC1-only inputs from KHIS ANC sites with matched pre-ART VL contribution.\n")
 
-full_anc_counts <- tibble::tibble(
-  County = analytics$County,
-  N_known = anc1_known_serostatus,
-  N_new_pos = analytics$total_new_pos_anc1,
-  N_known_pos = analytics$total_known_pos,
-  N_H = anc1_positive
-)
-
-matched_anc_neg_counts <- khis_preart_vl_sites %>%
+matched_anc_counts <- khis_preart_vl_sites %>%
   dplyr::transmute(
     County,
+    N_known = total_known_serostatus_anc1,
+    N_new_pos = total_new_pos_anc1,
+    N_known_pos = total_known_pos,
+    N_H = total_positive_anc1,
     N_neg = total_known_serostatus_anc1 - total_positive_anc1
   ) %>%
   dplyr::group_by(County) %>%
-  dplyr::summarise(N_neg = sum(N_neg, na.rm = TRUE), .groups = "drop")
+  dplyr::summarise(
+    dplyr::across(
+      c(N_known, N_new_pos, N_known_pos, N_H, N_neg),
+      \(x) sum(x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
 
 library(dplyr)
 
-anc_counts <- full_anc_counts %>%
-  group_by(County) %>%
-  summarise(across(c(N_known, N_new_pos, N_known_pos, N_H),
-                   \(x) sum(x, na.rm = TRUE)), .groups = "drop") %>%
-  dplyr::left_join(matched_anc_neg_counts, by = "County") %>%
+anc_counts <- matched_anc_counts %>%
   dplyr::mutate(N_neg = tidyr::replace_na(N_neg, 0))
 
 #remove county from county name
@@ -1012,7 +1223,13 @@ anc_counts$county <- gsub(" County$", "", anc_counts$County)
 
 cat("Calculating recency counts...\n")
 
-recency_counts <- recency %>%
+recency_incidence <- recency %>%
+  dplyr::filter(!is.na(site_mfl), site_mfl %in% included_recency_site_mfl)
+
+cat("  Recency records included in incidence facility universe:", nrow(recency_incidence), "of", nrow(recency), "\n")
+cat("  Recency facilities pending KHIS match and excluded:", nrow(unmatched_preart_vl_sites), "\n")
+
+recency_counts <- recency_incidence %>%
   dplyr::filter(lag_status_std == "TESTED", !is.na(lag_result_std)) %>%
   group_by(across(all_of("county"))) %>%
   summarise(
@@ -1025,7 +1242,7 @@ cat("  Strata:", nrow(recency_counts), "\n")
 cat("  Total tested for recency:", sum(recency_counts$N_testR), "\n")
 cat("  Total recent infections:", sum(recency_counts$N_R), "\n")
 
-vls_counts <- recency %>%
+vls_counts <- recency_incidence %>%
   dplyr::filter(!is.na(nnew_vl)) %>%
   dplyr::group_by(across(all_of("county"))) %>%
   dplyr::summarise(
@@ -1170,7 +1387,6 @@ estimate_one_stratum <- function(N_known, N_H, N_neg, N_testR, N_R,
                                  bs_count = BS_COUNT,
                                  alpha = ALPHA,
                                  min_rse = MIN_RSE_FOR_BOOT) {
-  
   # -------------------------------------------------------------------------
   # Validity Checks
   # -------------------------------------------------------------------------
@@ -1229,9 +1445,8 @@ estimate_one_stratum <- function(N_known, N_H, N_neg, N_testR, N_R,
   # -------------------------------------------------------------------------
   
   PrevH <- N_H / N_known      # HIV prevalence
-
-  # Protocol metric: proportion RITA recent in at-risk population.
-  prevr_denom <- N_R + N_neg
+  
+  prevr_denom <- N_neg + N_R
   PrevR <- N_R / prevr_denom
   
   # -------------------------------------------------------------------------
@@ -1429,16 +1644,36 @@ cat("  (This may take several minutes with", BS_COUNT, "bootstrap iterations)\n"
 analysis_df <- analysis_df %>%
   mutate(row_id = dplyr::row_number())
 
-# Apply estimation function to each row
-incidence_results <- analysis_df %>%
-  dplyr::select(row_id, all_of("county"), N_known, N_H, N_neg, N_testR, N_R) %>%
+# Apply protocol estimation function to each row
+incidence_inputs <- analysis_df %>%
+  dplyr::select(row_id, all_of("county"), N_known, N_H, N_neg, N_testR, N_R)
+
+incidence_results <- incidence_inputs %>%
   mutate(
     inc = purrr::pmap(
       list(N_known, N_H, N_neg, N_testR, N_R),
-      ~estimate_one_stratum(..1, ..2, ..3, ..4, ..5)
+      ~estimate_one_stratum(..1, ..2, ..3, ..4, ..5, frr = FRR_PROTOCOL)
     )
   ) %>%
   tidyr::unnest(inc, keep_empty = TRUE)
+
+protocol_frr_sensitivity_results <- incidence_inputs %>%
+  mutate(
+    inc_protocol_frr_sensitivity = purrr::pmap(
+      list(N_known, N_H, N_neg, N_testR, N_R),
+      ~estimate_one_stratum(..1, ..2, ..3, ..4, ..5, frr = FRR_SENSITIVITY, boot = FALSE)
+    )
+  ) %>%
+  dplyr::select(row_id, all_of("county"), inc_protocol_frr_sensitivity) %>%
+  tidyr::unnest(inc_protocol_frr_sensitivity, keep_empty = TRUE) %>%
+  dplyr::transmute(
+    row_id,
+    county,
+    Incidence_Protocol_FRR_0p4pct = Incidence
+  )
+
+incidence_results <- incidence_results %>%
+  dplyr::left_join(protocol_frr_sensitivity_results, by = c("row_id", "county"))
 
 cat("  Incidence estimation complete\n")
 
@@ -1446,6 +1681,7 @@ cat("  Incidence estimation complete\n")
 n_estimated <- sum(!is.na(incidence_results$Incidence))
 n_total <- nrow(incidence_results)
 cat("  Successfully estimated:", n_estimated, "of", n_total, "strata\n")
+cat("  Protocol FRR=0.004 proportion (0.4%) sensitivity estimates:", sum(!is.na(incidence_results$Incidence_Protocol_FRR_0p4pct)), "of", n_total, "strata\n")
 
 n_high_rse <- sum(!is.na(incidence_results$RSE_Inc) & incidence_results$RSE_Inc > HIGH_RSE_THRESHOLD)
 cat("  High-RSE strata (RSE >", sprintf("%.0f%%", HIGH_RSE_THRESHOLD * 100), "):", n_high_rse, "\n")
@@ -1481,15 +1717,26 @@ if (nrow(pooled_all_inputs) > 0) {
       N_testR = sum(N_testR, na.rm = TRUE),
       N_R = sum(N_R, na.rm = TRUE)
     )
-
+  
   pooled_all_estimate <- estimate_one_stratum(
     N_known = pooled_all_counts$N_known,
     N_H = pooled_all_counts$N_H,
     N_neg = pooled_all_counts$N_neg,
     N_testR = pooled_all_counts$N_testR,
-    N_R = pooled_all_counts$N_R
+    N_R = pooled_all_counts$N_R,
+    frr = FRR_PROTOCOL
   )
-
+  
+  pooled_all_estimate_protocol_frr_sensitivity <- estimate_one_stratum(
+    N_known = pooled_all_counts$N_known,
+    N_H = pooled_all_counts$N_H,
+    N_neg = pooled_all_counts$N_neg,
+    N_testR = pooled_all_counts$N_testR,
+    N_R = pooled_all_counts$N_R,
+    frr = FRR_SENSITIVITY,
+    boot = FALSE
+  )
+  
   pooled_all_summary <- dplyr::bind_cols(
     tibble::tibble(
       Stratum = "Combined_Recency_Tested",
@@ -1505,10 +1752,14 @@ if (nrow(pooled_all_inputs) > 0) {
       ),
       N_Tested_Recency = pooled_all_counts$N_testR,
       N_neg = pooled_all_counts$N_neg,
-      N_R = pooled_all_counts$N_R,
       N_Recent_Infections = pooled_all_counts$N_R,
       At_Risk_Population = pooled_all_counts$N_neg + pooled_all_counts$N_R,
-      Prop_RITA_Recent_percent = ifelse(
+      Prop_RITA_Recent_AtRisk_percent = ifelse(
+        (pooled_all_counts$N_neg + pooled_all_counts$N_R) > 0,
+        (pooled_all_counts$N_R / (pooled_all_counts$N_neg + pooled_all_counts$N_R)) * 100,
+        NA_real_
+      ),
+      PrevR_Protocol_percent = ifelse(
         (pooled_all_counts$N_neg + pooled_all_counts$N_R) > 0,
         (pooled_all_counts$N_R / (pooled_all_counts$N_neg + pooled_all_counts$N_R)) * 100,
         NA_real_
@@ -1516,7 +1767,11 @@ if (nrow(pooled_all_inputs) > 0) {
     ),
     pooled_all_estimate %>%
       dplyr::transmute(
-        HIV_Incidence_percent = Incidence * 100,
+        HIV_Incidence_Protocol_FRR_0pct_percent = Incidence * 100,
+        HIV_Incidence_Protocol_FRR_0pct_per_100000_population = format_incidence_per_100k(Incidence * 100),
+        HIV_Incidence_Protocol_FRR_0pct_Lower_CI_per_100000_population = pmax(CI_low * 100, 0) * 1000,
+        HIV_Incidence_Protocol_FRR_0pct_Upper_CI_per_100000_population = CI_up * 100 * 1000,
+        HIV_Incidence_Protocol_FRR_0p4pct_percent = pooled_all_estimate_protocol_frr_sensitivity$Incidence * 100,
         RSE = RSE_Inc,
         Lower_CI_percent = pmax(CI_low * 100, 0),
         Upper_CI_percent = CI_up * 100,
@@ -1541,8 +1796,13 @@ if (nrow(pooled_all_inputs) > 0) {
     N_Tested_Recency = NA_real_,
     N_Recent_Infections = NA_real_,
     At_Risk_Population = NA_real_,
-    Prop_RITA_Recent_percent = NA_real_,
-    HIV_Incidence_percent = NA_real_,
+    Prop_RITA_Recent_AtRisk_percent = NA_real_,
+    PrevR_Protocol_percent = NA_real_,
+    HIV_Incidence_Protocol_FRR_0pct_percent = NA_real_,
+    HIV_Incidence_Protocol_FRR_0pct_per_100000_population = NA_character_,
+    HIV_Incidence_Protocol_FRR_0pct_Lower_CI_per_100000_population = NA_real_,
+    HIV_Incidence_Protocol_FRR_0pct_Upper_CI_per_100000_population = NA_real_,
+    HIV_Incidence_Protocol_FRR_0p4pct_percent = NA_real_,
     RSE = NA_real_,
     Lower_CI_percent = NA_real_,
     Upper_CI_percent = NA_real_,
@@ -1592,6 +1852,7 @@ report_table <- final_results %>%
   dplyr::select(
     all_of("county"),
     N_Sites_Contributing_PreART_VL, # KHIS ANC sites matched to pre-ART VL contribution
+    N_Sites_Reporting_KHIS_ANC1, # All KHIS ANC1-reporting sites in the county
     N_known,                    # Total with known serostatus
     N_new_pos,                  # ANC1 new HIV diagnoses
     N_H,                        # Total HIV-positive
@@ -1601,32 +1862,53 @@ report_table <- final_results %>%
     N_VL_Suppressed,            # Number with VL < 1000 copies/mL
     VLS,                        # Viral load suppression among parseable VLs
     N_neg,                      # Restricted HIV-negative denominator
-    N_R = N_R,                  # Number recent
     N_Recent_Infections = N_R,  # Human-readable label for N_R
     At_Risk_Denominator,        # At-risk population
-    PropRITA_AtRisk,            # Proportion RITA recent at risk
-    Incidence,                  # Incidence estimate
+    PropRITA_AtRisk,            # Protocol descriptive proportion RITA recent at risk
+    Incidence,                  # Protocol-primary incidence estimate with FRR = 0
+    Incidence_Protocol_FRR_0p4pct, # Protocol-primary incidence sensitivity using FRR = 0.004 proportion (0.4%)
     RSE_Inc,                    # Relative Standard Error
     CI_low, CI_up,              # Confidence interval bounds
     Method,                     # Estimation method
     Data_Quality_Flag           # Data quality indicator
   )
 
- colnames(report_table) = c("County", "N_Sites_Contributing_PreART_VL", "N_Known_Serostatus", "N_New_HIV_Diagnoses", "N_HIV_Positive", "HIV_Prevalence_%", 
-                           "N_Tested_Recency", "N_With_VL", "N_VL_Suppressed", "VLS_%", "N_neg", "N_R", "N_Recent_Infections", "At_Risk_Population", 
-                           "Prop_RITA_Recent_%", "HIV_Incidence_%", "RSE", "Lower_CI_%", "Upper_CI_%", 
-                           "Method", "Data_Quality")
+colnames(report_table) = c("County", "N_Sites_Contributing_PreART_VL", "N_Sites_Reporting_KHIS_ANC1", "N_Known_Serostatus", "N_New_HIV_Diagnoses", "N_HIV_Positive", "HIV_Prevalence_%", 
+                           "N_Tested_Recency", "N_With_VL", "N_VL_Suppressed", "VLS_%", "N_neg", "N_Recent_Infections", "At_Risk_Population", 
+                           "Prop_RITA_Recent_AtRisk_%", "HIV_Incidence_Protocol_FRR_0pct_%", "HIV_Incidence_Protocol_FRR_0p4pct_%",
+                           "RSE", "Lower_CI_%", "Upper_CI_%", "Method", "Data_Quality")
 
 # Convert percentages and truncate negative CIs at zero
 report_table[["HIV_Prevalence_%"]] <- report_table[["HIV_Prevalence_%"]] * 100
 report_table[["VLS_%"]] <- report_table[["VLS_%"]] * 100
-report_table[["Prop_RITA_Recent_%"]] <- report_table[["Prop_RITA_Recent_%"]] * 100
-report_table[["HIV_Incidence_%"]] <- report_table[["HIV_Incidence_%"]] * 100
+report_table[["Prop_RITA_Recent_AtRisk_%"]] <- report_table[["Prop_RITA_Recent_AtRisk_%"]] * 100
+report_table[["HIV_Incidence_Protocol_FRR_0pct_%"]] <- report_table[["HIV_Incidence_Protocol_FRR_0pct_%"]] * 100
+report_table[["HIV_Incidence_Protocol_FRR_0p4pct_%"]] <- report_table[["HIV_Incidence_Protocol_FRR_0p4pct_%"]] * 100
 report_table[["Lower_CI_%"]] <- report_table[["Lower_CI_%"]] * 100
 report_table[["Upper_CI_%"]] <- report_table[["Upper_CI_%"]] * 100
 
 # Truncate negative LCL at zero (incidence cannot be negative)
 report_table[["Lower_CI_%"]][report_table[["Lower_CI_%"]] < 0] <- 0
+
+report_table[["HIV_Incidence_Protocol_FRR_0pct_per_100000_population"]] <-
+  format_incidence_per_100k(report_table[["HIV_Incidence_Protocol_FRR_0pct_%"]])
+report_table[["HIV_Incidence_Protocol_FRR_0pct_Lower_CI_per_100000_population"]] <-
+  report_table[["Lower_CI_%"]] * 1000
+report_table[["HIV_Incidence_Protocol_FRR_0pct_Upper_CI_per_100000_population"]] <-
+  report_table[["Upper_CI_%"]] * 1000
+report_table <- report_table %>%
+  dplyr::relocate(
+    HIV_Incidence_Protocol_FRR_0pct_per_100000_population,
+    .after = dplyr::all_of("HIV_Incidence_Protocol_FRR_0pct_%")
+  ) %>%
+  dplyr::relocate(
+    HIV_Incidence_Protocol_FRR_0pct_Lower_CI_per_100000_population,
+    .after = dplyr::all_of("HIV_Incidence_Protocol_FRR_0pct_per_100000_population")
+  ) %>%
+  dplyr::relocate(
+    HIV_Incidence_Protocol_FRR_0pct_Upper_CI_per_100000_population,
+    .after = dplyr::all_of("HIV_Incidence_Protocol_FRR_0pct_Lower_CI_per_100000_population")
+  )
 
 high_rse_summary <- report_table %>%
   dplyr::filter(!is.na(RSE), RSE > HIGH_RSE_THRESHOLD) %>%
@@ -1639,12 +1921,19 @@ run_summary <- tibble::tibble(
     "Deviation note",
     "Prevalence scope",
     "ANC site restriction",
+    "Incidence ANC count universe",
     "Matched KHIS pre-ART VL sites",
+    "Linked recency pre-ART VL sites",
     "Unmatched pre-ART VL sites",
-    "PrevR basis",
-    "RSE_PrevR basis",
+    "Reviewed facility crosswalk links applied",
+    "Facility crosswalk path",
+    "Protocol PrevR basis for primary incidence",
+    "RSE_PrevR basis for primary incidence",
     "VL threshold basis",
     "VLS basis",
+    "Protocol FRR assumption",
+    "Protocol FRR sensitivity column",
+    "Protocol FRR sensitivity interpretation",
     "Pooled recency-tested-counties sheet",
     "Pooled recency-tested-counties county count",
     "Total strata in report",
@@ -1655,15 +1944,22 @@ run_summary <- tibble::tibble(
   Value = c(
     "ANC1 HIV-negative + ANC1 HIV-positive",
     "ANC1 HIV-negative + ANC1 HIV-positive",
-    "None; analysis follows protocol ANC1-only denominator",
-    "County-level ANC1 prevalence uses all ANC1 KHIS sites",
+    "Incidence denominator restricted to matched pre-ART VL-contributing ANC sites for consistency with recency/VL source",
+    "County-level incidence prevalence uses matched pre-ART VL-contributing KHIS ANC sites",
     "Incidence HIV-negative denominator restricted to KHIS ANC sites with matched pre-ART VL contribution",
+    "N_Known_Serostatus, N_HIV_Positive, and N_neg all come from matched pre-ART VL-contributing KHIS ANC sites",
     as.character(dplyr::n_distinct(khis_preart_vl_sites$mfl)),
+    as.character(dplyr::n_distinct(included_recency_site_mfl)),
     as.character(nrow(unmatched_preart_vl_sites)),
-    "N_R / (N_neg + N_R)",
-    "Same denominator as PrevR: N_neg + N_R",
+    as.character(nrow(reviewed_site_links)),
+    crosswalk_path,
+    "Prop_RITA_Recent_AtRisk_% = N_Recent_Infections / (N_neg + N_Recent_Infections); this is the primary protocol PrevR basis",
+    "Same denominator as primary protocol PrevR: N_neg + N_Recent_Infections",
     "VL >= 1000 = RECENT; VL < 1000 = LONGTERM",
     "VL < 1000 copies/mL among parseable recency VL results",
+    "FRR = 0.000 (0.0%)",
+    "HIV_Incidence_Protocol_FRR_0p4pct_% uses FRR = 0.004 as a proportion (0.4%; not 0.004%) with the same MDRI, BigT, PrevH, and protocol PrevR inputs",
+    "Sensitivity estimates are left untruncated; negative values indicate the assumed FRR exceeds the observed protocol PrevR",
     "Pools counties with dashboard recency-tested records using the same incidence method",
     as.character(nrow(pooled_all_inputs)),
     as.character(nrow(report_table)),
@@ -1684,8 +1980,12 @@ if (nrow(high_rse_summary) == 0) {
     VLS_percent = NA_real_,
     N_Recent_Infections = NA_real_,
     At_Risk_Population = NA_real_,
-    Prop_RITA_Recent_percent = NA_real_,
-    HIV_Incidence_percent = NA_real_,
+    Prop_RITA_Recent_AtRisk_percent = NA_real_,
+    HIV_Incidence_Protocol_FRR_0pct_percent = NA_real_,
+    HIV_Incidence_Protocol_FRR_0pct_per_100000_population = NA_character_,
+    HIV_Incidence_Protocol_FRR_0pct_Lower_CI_per_100000_population = NA_real_,
+    HIV_Incidence_Protocol_FRR_0pct_Upper_CI_per_100000_population = NA_real_,
+    HIV_Incidence_Protocol_FRR_0p4pct_percent = NA_real_,
     RSE = NA_real_,
     Lower_CI_percent = NA_real_,
     Upper_CI_percent = NA_real_,
@@ -1693,8 +1993,9 @@ if (nrow(high_rse_summary) == 0) {
     Data_Quality = paste0("No strata exceeded ", sprintf("%.0f%%", HIGH_RSE_THRESHOLD * 100), " RSE")
   )
 } else {
-  names(high_rse_summary)[names(high_rse_summary) == "Prop_RITA_Recent_%"] <- "Prop_RITA_Recent_percent"
-  names(high_rse_summary)[names(high_rse_summary) == "HIV_Incidence_%"] <- "HIV_Incidence_percent"
+  names(high_rse_summary)[names(high_rse_summary) == "Prop_RITA_Recent_AtRisk_%"] <- "Prop_RITA_Recent_AtRisk_percent"
+  names(high_rse_summary)[names(high_rse_summary) == "HIV_Incidence_Protocol_FRR_0pct_%"] <- "HIV_Incidence_Protocol_FRR_0pct_percent"
+  names(high_rse_summary)[names(high_rse_summary) == "HIV_Incidence_Protocol_FRR_0p4pct_%"] <- "HIV_Incidence_Protocol_FRR_0p4pct_percent"
   names(high_rse_summary)[names(high_rse_summary) == "Lower_CI_%"] <- "Lower_CI_percent"
   names(high_rse_summary)[names(high_rse_summary) == "Upper_CI_%"] <- "Upper_CI_percent"
 }
@@ -1769,6 +2070,7 @@ data_dictionary <- tibble::tibble(
   `Column name` = c(
     "County",
     "N_Sites_Contributing_PreART_VL",
+    "N_Sites_Reporting_KHIS_ANC1",
     "N_Known_Serostatus",
     "N_New_HIV_Diagnoses",
     "N_HIV_Positive",
@@ -1778,11 +2080,14 @@ data_dictionary <- tibble::tibble(
     "N_VL_Suppressed",
     "VLS_%",
     "N_neg",
-    "N_R",
     "N_Recent_Infections",
     "At_Risk_Population",
-    "Prop_RITA_Recent_%",
-    "HIV_Incidence_%",
+    "Prop_RITA_Recent_AtRisk_%",
+    "HIV_Incidence_Protocol_FRR_0pct_%",
+    "HIV_Incidence_Protocol_FRR_0pct_per_100000_population",
+    "HIV_Incidence_Protocol_FRR_0pct_Lower_CI_per_100000_population",
+    "HIV_Incidence_Protocol_FRR_0pct_Upper_CI_per_100000_population",
+    "HIV_Incidence_Protocol_FRR_0p4pct_%",
     "RSE",
     "Lower_CI_%",
     "Upper_CI_%",
@@ -1791,21 +2096,25 @@ data_dictionary <- tibble::tibble(
   ),
   `Source/calculation` = c(
     "County analysis stratum from KHIS totals joined to county-level recency counts.",
-    "Diagnostic count of KHIS ANC facilities in the county matched to facilities contributing at least one pre-ART VL sample; not used to restrict the incidence denominator.",
-    "County sum of KHIS total_known_serostatus_anc1 = ANC1 HIV-negative + ANC1 HIV-positive.",
-    "County sum of KHIS total_new_pos_anc1.",
-    "County sum of KHIS total_positive_anc1, including known positives and new ANC1 positives.",
-    "Computed as N_HIV_Positive / N_Known_Serostatus * 100 using all ANC1 KHIS sites at county level.",
-    "County count of dashboard recency-tested records, defined as lag_status == TESTED with a reported lag_result.",
-    "County count of recency records with parseable viral load values.",
-    "County count of parseable recency viral load values below 1000 copies/mL.",
+    "Count of KHIS ANC facilities in the county included in the incidence denominator after linking to recency/pre-ART VL facilities.",
+    "Count of distinct KHIS facilities in the county with any ANC1 reporting in the analytics extract.",
+    "County sum of KHIS total_known_serostatus_anc1 among matched pre-ART VL-contributing ANC sites = ANC1 HIV-negative + ANC1 HIV-positive.",
+    "County sum of KHIS total_new_pos_anc1 among matched pre-ART VL-contributing ANC sites.",
+    "County sum of KHIS total_positive_anc1 among matched pre-ART VL-contributing ANC sites, including known positives and new ANC1 positives.",
+    "Computed as N_HIV_Positive / N_Known_Serostatus * 100 using matched pre-ART VL-contributing ANC sites at county level.",
+    "County count of linked-facility dashboard recency-tested records, defined as lag_status == TESTED with a reported lag_result.",
+    "County count of linked-facility recency records with parseable viral load values.",
+    "County count of linked-facility parseable recency viral load values below 1000 copies/mL.",
     "Computed as N_VL_Suppressed / N_With_VL * 100. Below-limit VL values such as '<40' are counted as suppressed.",
     "County sum of KHIS ANC1 HIV-negative clients restricted to ANC sites with matched pre-ART VL contribution.",
-    "Number of final RITA recent infections used in PrevR and incidence estimation.",
     "County count of recency records with final RITA classification RECENT.",
-    "Computed as N_neg + N_R, where N_neg is the matched-site KHIS ANC1 HIV-negative county denominator.",
-    "Computed as N_R / (N_neg + N_R) * 100.",
-    "Computed with inctools::incprops() using PrevH, PrevR, MDRI = 130, FRR = 0, and BigT = 365, then expressed as percent.",
+    "Computed as N_neg + N_Recent_Infections, where N_neg is the matched-site KHIS ANC1 HIV-negative county denominator.",
+    "Protocol at-risk metric, computed as N_Recent_Infections / (N_neg + N_Recent_Infections) * 100. This is the primary PrevR basis.",
+    "Primary protocol estimate computed with inctools::incprops() using PrevH, protocol PrevR = N_Recent_Infections / (N_neg + N_Recent_Infections), MDRI = 130, FRR = 0% (0.000 proportion), and BigT = 365, then expressed as percent.",
+    "Display version of the primary protocol incidence estimate, computed as HIV_Incidence_Protocol_FRR_0pct_% * 1,000 and formatted as 'xxx per 100,000'.",
+    "Lower 95% confidence bound for the primary protocol incidence estimate, computed as Lower_CI_% * 1,000.",
+    "Upper 95% confidence bound for the primary protocol incidence estimate, computed as Upper_CI_% * 1,000.",
+    "Protocol sensitivity estimate computed with the same inputs as HIV_Incidence_Protocol_FRR_0pct_% but FRR = 0.004 as a proportion (0.4%; not 0.004%), then expressed as percent. Values are not truncated at zero.",
     "Relative standard error of the incidence estimate.",
     "Lower confidence bound for incidence, converted to percent and truncated at zero if negative.",
     "Upper confidence bound for incidence, converted to percent.",
@@ -1813,6 +2122,93 @@ data_dictionary <- tibble::tibble(
     "Interpretive flag based on estimability and RSE thresholds."
   )
 )
+
+incidence_input_definitions <- tibble::tibble(
+  Item = c(
+    "Primary protocol incidence formula",
+    "Incidence percent",
+    "Incidence per 100,000 display",
+    "Incidence lower 95% CI per 100,000",
+    "Incidence upper 95% CI per 100,000",
+    "PrevH",
+    "PrevR_Protocol",
+    "N_Known_Serostatus",
+    "N_HIV_Positive",
+    "N_neg",
+    "N_Tested_Recency",
+    "N_Recent_Infections",
+    "MDRI",
+    "BigT",
+    "FRR protocol",
+    "FRR sensitivity",
+    "RSE_MDRI",
+    "RSE_FRR",
+    "Primary uncertainty method",
+    "Sensitivity uncertainty method"
+  ),
+  Definition = c(
+    "HIV_Incidence_Protocol = [PrevH * (PrevR_Protocol - FRR)] / [(1 - PrevH) * (MDRI_years - FRR * BigT_years)], where PrevR_Protocol = N_Recent_Infections / (N_neg + N_Recent_Infections).",
+    "Incidence_percent = Incidence * 100.",
+    "Incidence_per_100000 = Incidence_percent * 1,000, formatted as 'xxx per 100,000'.",
+    "Lower_CI_per_100000 = Lower_CI_percent * 1,000. This is a separate numeric column for Power BI interval plotting.",
+    "Upper_CI_per_100000 = Upper_CI_percent * 1,000. This is a separate numeric column for Power BI interval plotting.",
+    "HIV prevalence among the incidence-analysis ANC count universe: N_HIV_Positive / N_Known_Serostatus.",
+    "Protocol at-risk recency measure: N_Recent_Infections / (N_neg + N_Recent_Infections). This is the primary incidence PrevR basis.",
+    "ANC1 known-serostatus clients from KHIS ANC sites matched to pre-ART VL-contributing recency sites.",
+    "ANC1 HIV-positive clients from the same matched KHIS ANC site universe.",
+    "ANC1 HIV-negative clients from the same matched KHIS ANC site universe; equals N_Known_Serostatus - N_HIV_Positive in the incidence workbook.",
+    "Linked-facility dashboard records tested for recency in the county stratum.",
+    "Final RITA recent infections among linked-facility N_Tested_Recency.",
+    sprintf("%s days, converted in inctools to %.6f years.", MDRI_DAYS, MDRI_DAYS / 365.25),
+    sprintf("%s days, converted in inctools to %.6f years.", BIGT_DAYS, BIGT_DAYS / 365.25),
+    sprintf("%.3f as a proportion (%.1f%%), used for HIV_Incidence_Protocol_FRR_0pct_%%.", FRR_PROTOCOL, FRR_PROTOCOL * 100),
+    sprintf("%.3f as a proportion (%.1f%%; not 0.004%%), used for HIV_Incidence_Protocol_FRR_0p4pct_%%.", FRR_SENSITIVITY, FRR_SENSITIVITY * 100),
+    sprintf("%.6f, derived from MDRI 95%% CI [%s, %s].", RSE_MDRI, MDRI_CI[1], MDRI_CI[2]),
+    sprintf("%.6f.", RSE_FRR),
+    sprintf("inctools::incprops() with protocol PrevR and bootstrap enabled, BS_Count = %s, for FRR = 0.", BS_COUNT),
+    "inctools::incprops() with bootstrap disabled for the FRR = 0.004 proportion (0.4%) protocol sensitivity point-estimate column."
+  )
+)
+
+incidence_calculation_audit <- report_table %>%
+  dplyr::mutate(
+    PrevH_formula = .data[["N_HIV_Positive"]] / .data[["N_Known_Serostatus"]],
+    PrevR_Protocol_formula = .data[["N_Recent_Infections"]] / (.data[["N_neg"]] + .data[["N_Recent_Infections"]]),
+    MDRI_years = MDRI_DAYS / 365.25,
+    BigT_years = BIGT_DAYS / 365.25,
+    Formula_Protocol_FRR_0pct_percent = 100 * (
+      PrevH_formula * (PrevR_Protocol_formula - FRR_PROTOCOL)
+    ) / (
+      (1 - PrevH_formula) * (MDRI_years - FRR_PROTOCOL * BigT_years)
+    ),
+    Formula_Protocol_FRR_0p4pct_percent = 100 * (
+      PrevH_formula * (PrevR_Protocol_formula - FRR_SENSITIVITY)
+    ) / (
+      (1 - PrevH_formula) * (MDRI_years - FRR_SENSITIVITY * BigT_years)
+    ),
+    Output_Protocol_FRR_0pct_percent = .data[["HIV_Incidence_Protocol_FRR_0pct_%"]],
+    Output_Protocol_FRR_0p4pct_percent = .data[["HIV_Incidence_Protocol_FRR_0p4pct_%"]],
+    Difference_Protocol_FRR_0pct_percent = abs(Formula_Protocol_FRR_0pct_percent - Output_Protocol_FRR_0pct_percent),
+    Difference_Protocol_FRR_0p4pct_percent = abs(Formula_Protocol_FRR_0p4pct_percent - Output_Protocol_FRR_0p4pct_percent)
+  ) %>%
+  dplyr::select(
+    County,
+    N_Known_Serostatus,
+    N_HIV_Positive,
+    N_neg,
+    N_Tested_Recency,
+    N_Recent_Infections,
+    PrevH_formula,
+    PrevR_Protocol_formula,
+    MDRI_years,
+    BigT_years,
+    Formula_Protocol_FRR_0pct_percent,
+    Output_Protocol_FRR_0pct_percent,
+    Difference_Protocol_FRR_0pct_percent,
+    Formula_Protocol_FRR_0p4pct_percent,
+    Output_Protocol_FRR_0p4pct_percent,
+    Difference_Protocol_FRR_0p4pct_percent
+  )
 
 report_out_base <- Sys.getenv("INCIDENCE_REPORT_XLSX", unset = file.path("documents", "report_table_new.xlsx"))
 report_out_dir <- dirname(report_out_base)
@@ -1831,8 +2227,11 @@ dir.create(report_out_dir, showWarnings = FALSE, recursive = TRUE)
 writexl::write_xlsx(
   list(
     County_Results = report_table,
+    Incidence_Input_Definitions = incidence_input_definitions,
+    Incidence_Calculation_Audit = incidence_calculation_audit,
     Data_Dictionary = data_dictionary,
     KHIS_PreART_VL_Sites = khis_preart_vl_sites,
+    Facility_Match_Review = facility_match_review,
     Unmatched_PreART_VL_Sites = unmatched_preart_vl_sites,
     Exact_MFL_Master_Matches = exact_mfl_master_matches,
     Still_Unresolved = still_unresolved_name_suggestions,
@@ -1859,7 +2258,8 @@ incidence_out_path <- file.path(EXTERNAL_OUTPUT_DIR,"hivit_incidence.xlsx")
 writexl::write_xlsx(
   list(
     County_Results = report_table,
-    Data_Dictionary = data_dictionary
+    Data_Dictionary = data_dictionary,
+    Combined_Recency_Tested = pooled_all_summary
   ),
   incidence_out_path
 )
